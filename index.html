@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<title>Contiguous Memory Allocation Simulator + Benchmark</title>
+<link rel="stylesheet" href="style.css">
+<!-- Chart.js cần để vẽ biểu đồ -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <h2>Simulator: Phân bổ bộ nhớ liên tục</h2>
+
+  <div class="controls">
+    <label>Kích thước tiến trình: <input id="size" type="number" min="1" value="8" style="width:80px"></label>
+    <label>Chiến lược:
+      <select id="strategy">
+        <option value="first">First Fit</option>
+        <option value="best">Best Fit</option>
+        <option value="worst">Worst Fit</option>
+      </select>
+    </label>
+    <button id="alloc">Allocate</button>
+    <label>ID để free: <input id="freeId" style="width:80px" placeholder="proc-1"></label>
+    <button id="free">Free</button>
+    <button id="compact">Compact</button>
+    <button id="random">Random alloc/free</button>
+    <button id="reset">Reset Stats</button>
+
+  </div>
+
+  <div>
+    <div class="stat">Tổng ô: <strong id="totalCells">100</strong></div>
+    <div class="stat">Ô đã dùng: <strong id="usedCells">0</strong></div>
+    <div class="stat">Holes: <strong id="holesCount">0</strong></div>
+    <div class="stat">External fragmentation: <strong id="extFrag">0%</strong></div>
+    <div class="stat">Alloc Count: <strong id="allocCount">0</strong></div>
+    <div class="stat">Success Count: <strong id="successCount">0</strong></div>
+    <div class="stat">Success Rate: <strong id="successRate">0%</strong></div>
+    <div class="stat">avgNeed: <strong id="avgNeed">0</strong></div>
+    <div class="stat">Wasted: <strong id="wasted">0</strong></div>
+
+  </div>
+
+  <div class="memory" id="memory"></div>
+
+  <h4>Danh sách tiến trình</h4>
+  <table id="ptable">
+    <thead><tr><th>ID</th><th>Start</th><th>Size</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h4>Log</h4>
+  <div id="log" style="white-space:pre-wrap; max-height:200px; overflow:auto; border:1px solid #ddd; padding:6px;"></div>
+
+  <!-- ---------- BENCHMARK UI ---------- -->
+  <hr>
+  <h3>Benchmark (First / Best / Worst)</h3>
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+    <label>Workload:
+      <select id="workload">
+        <option value="A">A — Small dominated (Best Fit win)</option>
+        <option value="B">B — Large dominated (First Fit win)</option>
+        <option value="C">C — Mixed (Worst Fit lose)</option>
+      </select>
+    </label>
+
+    <label>Số thao tác (ops): <input id="opsCount" type="number" value="2000" style="width:100px"></label>
+    <label>Kích thước bộ nhớ: <input id="memSize" type="number" value="100" style="width:80px"></label>
+
+    <button id="btnRun">Run Benchmark</button>
+    <button id="btnDownload">Download CSV</button>
+  </div>
+
+  <canvas id="chart" width="700" height="220" style="border:1px solid #eee;"></canvas>
+
+<!-- ---------- SIMULATOR SCRIPT (giữ nguyên) ---------- -->
+<script>
+(function(){
+  const CELLS = 100;
+  document.getElementById('totalCells').innerText = CELLS;
+  let memory = new Array(CELLS).fill(null); // null = free; otherwise {id,size}
+  let procCounter = 1;
+  let success = 0;
+  let fail = 0;
+  let allocCount = 0; 
+  let procSizes = [];
+
+  const memDiv = document.getElementById('memory');
+  // Bảng màu xoay vòng
+const COLORS = [
+  "#e74c3c", "#9b59b6", "#f39c12", "#1abc9c", "#3498db",
+  "#2ecc71", "#d35400", "#7f8c8d", "#16a085", "#c0392b",
+  "#8e44ad", "#27ae60", "#2980b9", "#f1c40f", "#34495e"
+];
+
+function getColor(id) {
+  const num = parseInt(id.replace("proc-", ""));
+  return COLORS[(num - 1) % COLORS.length];
+}
+
+function render(){
+  memDiv.innerHTML = '';
+  for(let i=0;i<CELLS;i++){
+    const c = document.createElement('div');
+    if (memory[i]) {
+      const id = memory[i].id;
+      c.className = 'cell';
+      c.style.backgroundColor = getColor(id); // 🔥 tô màu trực tiếp
+      c.title = id;
+    } else {
+      c.className = 'cell hole';
+    }
+    memDiv.appendChild(c);
+  }
+  updateStats();
+  renderTable();
+}
+
+
+  function updateStats(){
+  const used = memory.filter(x=>x).length;
+  document.getElementById('usedCells').innerText = used;
+
+  const holes = calcHoles();
+  document.getElementById('holesCount').innerText = holes.length;
+
+  const free = CELLS - used;
+  let wasted = 0;
+
+  // 🔥 avgNeed chuẩn: trung bình kích thước tiến trình đã cấp phát
+  const avgNeed = calcAvgNeed();
+
+
+  holes.forEach(h=>{
+    if(h.size < avgNeed) wasted += h.size;
+  });
+
+  document.getElementById('extFrag').innerText = free
+    ? Math.round(100 * wasted / free) + '%'
+    : '0%';
+
+  // 🔥 cập nhật số liệu thống kê
+  document.getElementById('wasted').innerText = wasted;
+  document.getElementById('allocCount').innerText = allocCount;
+  document.getElementById('successCount').innerText = success;
+
+  const totalOps = success + fail;
+  const rate = totalOps ? (success / totalOps * 100).toFixed(1) : 0;
+  document.getElementById('successRate').innerText = rate + '%';
+
+  document.getElementById('avgNeed').innerText = avgNeed.toFixed(1);
+}
+
+
+
+  function calcHoles(){
+    const holes=[];
+    let i=0;
+    while(i<CELLS){
+      if(!memory[i]){
+        let j=i;
+        while(j<CELLS && !memory[j]) j++;
+        holes.push({start:i,size:j-i});
+        i=j;
+      } else i++;
+    }
+    return holes;
+  }
+
+  function renderTable(){
+    const tbody = document.querySelector('#ptable tbody');
+    tbody.innerHTML='';
+    const procs = {};
+    for(let i=0;i<CELLS;i++){
+      if(memory[i]) {
+        const id=memory[i].id;
+        if(!procs[id]) procs[id]= {id,start:i,size:0};
+        procs[id].size++;
+      }
+    }
+    Object.values(procs).sort((a,b)=>a.start-b.start).forEach(p=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${p.id}</td><td>${p.start}</td><td>${p.size}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  function log(msg){
+    const d = new Date().toLocaleTimeString();
+    document.getElementById('log').innerHTML = `<div>[${d}] ${msg}</div>` + document.getElementById('log').innerHTML;
+  }
+
+  function allocate(size,strat){
+    size = Math.max(1, Math.floor(size));
+    allocCount++;
+    const holes = calcHoles();
+    let candidate = null;
+    if(strat==='first'){
+      candidate = holes.find(h=>h.size>=size);
+    } else if(strat==='best'){
+      candidate = holes.filter(h=>h.size>=size).sort((a,b)=>a.size-b.size)[0];
+    } else if(strat==='worst'){
+      candidate = holes.filter(h=>h.size>=size).sort((a,b)=>b.size-a.size)[0];
+    }
+    if(!candidate){
+      log(`Không tìm được hole đủ lớn cho kích thước ${size}`);
+      fail++;
+      return null;
+    }
+    const id = 'proc-'+(procCounter++);
+    for(let i=0;i<size;i++){
+      memory[candidate.start + i] = {id};
+    }
+    success++;
+    procSizes.push(size); 
+    log(`Allocated ${id} size=${size} at ${candidate.start} (strategy=${strat})`);
+    return id;
+  }
+
+  function freeById(id){
+    let found=false;
+    for(let i=0;i<CELLS;i++) {
+      if(memory[i] && memory[i].id===id) {
+        memory[i]=null; found=true;
+      }
+    }
+    if(found) log(`Freed ${id}`);
+    else log(`Không tìm thấy ${id}`);
+  }
+
+  function compact(){
+    const newMem = new Array(CELLS).fill(null);
+    let write=0;
+    for(let i=0;i<CELLS;i++){
+      if(memory[i]){
+        const id = memory[i].id;
+        if(i===0 || memory[i-1]===null || memory[i-1].id !== id){
+          let j=i; while(j<CELLS && memory[j] && memory[j].id===id) j++;
+          const size = j-i;
+          for(let k=0;k<size;k++) newMem[write+k] = {id};
+          write += size;
+        }
+      }
+    }
+    memory = newMem;
+    log('Compaction: dồn các tiến trình về trái');
+    render();
+  }
+
+
+  function resetStats(){
+  success = 0;        // số lần cấp phát thành công
+  fail = 0;           // số lần cấp phát thất bại
+  allocCount = 0;     // tổng số lần gọi allocate
+  procSizes = [];     // danh sách kích thước tiến trình đã cấp phát
+
+  // reset giao diện hiển thị
+  document.getElementById('usedCells').innerText = 0;
+  document.getElementById('holesCount').innerText = 0;
+  document.getElementById('extFrag').innerText = '0%';
+  document.getElementById('successRate').innerText = '0%';
+  document.getElementById('allocCount').innerText = 0;
+  document.getElementById('successCount').innerText = 0;
+  document.getElementById('avgNeed').innerText = 0;
+  }
+  
+  
+  function calcAvgNeed(){
+  const procs = {};
+  for(let i=0;i<CELLS;i++){
+    if(memory[i]){
+      const id = memory[i].id;
+      if(!procs[id]) procs[id] = 0;
+      procs[id]++;
+    }
+  }
+  const sizes = Object.values(procs);
+  return sizes.length ? sizes.reduce((a,b)=>a+b,0) / sizes.length : 0;
+}
+
+
+
+  // init render
+  render();
+
+  // hooks
+  document.getElementById('alloc').onclick = ()=> {
+    const size = Number(document.getElementById('size').value) || 1;
+    const strat = document.getElementById('strategy').value;
+    const id = allocate(size,strat);
+    render();
+    if(id) {
+      document.getElementById('freeId').value = id;
+    }
+  };
+
+  document.getElementById('free').onclick = ()=> {
+  const id = document.getElementById('freeId').value.trim();
+  if(!id) {
+    alert('Nhập ID để free (ví dụ proc-1)');
+    return;
+  }
+  freeById(id);
+  render();
+};
+
+  document.getElementById('random').onclick = ()=>{ 
+  for(let t=0;t<12;t++){
+    if(Math.random()<0.6){
+      const size = Math.floor(Math.random()*12)+1;
+      allocate(size, ['first','best','worst'][Math.floor(Math.random()*3)]);
+    } else {
+      const ids = Array.from(new Set(memory.filter(x=>x).map(x=>x.id)));
+      if(ids.length) freeById(ids[Math.floor(Math.random()*ids.length)]);
+    }
+  }
+  render();
+};
+
+
+  document.getElementById('compact').onclick = ()=> compact();
+
+  // random alloc/free
+  document.getElementById('random').onclick = ()=>{ 
+    for(let t=0;t<12;t++){
+      if(Math.random()<0.6){
+        const size = Math.floor(Math.random()*12)+1;
+        allocate(size, ['first','best','worst'][Math.floor(Math.random()*3)]);
+      } else {
+        const ids = Array.from(new Set(memory.filter(x=>x).map(x=>x.id)));
+        if(ids.length) freeById(ids[Math.floor(Math.random()*ids.length)]);
+      }
+    }
+    render();
+  };
+
+  // expose some helpers globally for benchmark.js if you want (optional)
+  window._sim_memory = () => memory.slice();
+  window._sim_reset = () => { memory = new Array(CELLS).fill(null); procCounter = 1; render(); };
+
+
+  document.getElementById('reset').onclick = ()=> {
+  resetStats();
+  memory = new Array(CELLS).fill(null); // xóa bộ nhớ
+  procCounter = 1;                      // reset ID tiến trình
+  render();                             // vẽ lại giao diện
+};
+})();
+
+
+ 
+
+</script>
+
+<!-- ---------- BENCHMARK SCRIPT (tập tin riêng) ---------- -->
+<script src="benchmark.js"></script>
+
+<script>
+// Kết nối nút Run / Download CSV tới benchmark.js (runBenchmark, downloadCSV đã định nghĩa trong benchmark.js)
+window.addEventListener('load', () => {
+  const btn = document.getElementById('btnRun');
+  const dl = document.getElementById('btnDownload');
+  const logBox = document.getElementById('log');
+  const workloadSel = document.getElementById('workload');
+
+  function log(msg){
+    logBox.textContent = msg + "\n" + logBox.textContent;
+  }
+
+  btn.onclick = async () => {
+    logBox.textContent = ""; // clear
+    const opsCount = Number(document.getElementById('opsCount').value) || 2000;
+    const memSize = Number(document.getElementById('memSize').value) || 100;
+    const workload = workloadSel.value;
+
+    const results = await runBenchmark({
+      workloadCount: 1,
+      opsCount,
+      memSize,
+      seed: Date.now()
+    }, (m) => log(m) );
+
+    // draw chart and enable download
+    drawChart(results);
+    window._lastResults = results;
+  };
+
+  dl.onclick = () => {
+    if (window._lastResults) {
+      const csv = resultsToCSV(window._lastResults);
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'benchmark_results.csv';
+      a.click();
+    } else alert('Chưa có kết quả. Chạy benchmark trước.');
+  };
+});
+</script>
+</body>
+</html>
